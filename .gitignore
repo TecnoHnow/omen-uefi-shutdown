@@ -1,0 +1,9 @@
+/build/
+*.o
+*.so
+*.efi
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+.DS_Store

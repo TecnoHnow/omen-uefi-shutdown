@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG=/etc/omen-uefi-shutdown.conf
+ENTRY_ID=omen-shutdown.conf
+LABEL="OMEN UEFI Shutdown"
+VERSION="0.2.1"
+YES=0
+ACTION=shutdown
+
+usage() {
+    cat <<USAGE
+OMEN UEFI Shutdown $VERSION
+
+Usage:
+  omen-shutdown [--yes]
+  omen-shutdown --status
+  omen-shutdown --doctor
+  omen-shutdown --cancel
+  omen-shutdown --version
+
+Options:
+  --yes, -y    Do not ask for interactive confirmation.
+  --status     Show installed configuration.
+  --doctor     Run read-only compatibility diagnostics.
+  --cancel     Clear a pending one-shot/BootNext request.
+  --version    Print the version.
+USAGE
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --yes|-y) YES=1 ;;
+        --status) ACTION=status ;;
+        --doctor) ACTION=doctor ;;
+        --cancel) ACTION=cancel ;;
+        --version) ACTION=version ;;
+        --help|-h) usage; exit 0 ;;
+        *) printf 'Unknown argument: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [[ "$ACTION" == version ]]; then
+    printf '%s\n' "$VERSION"
+    exit 0
+fi
+
+ESP=""
+EFI_REL="/EFI/omen-uefi-shutdown/omen-shutdown.efi"
+BOOTNUM=""
+BACKEND="auto"
+
+if [[ -r "$CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+fi
+
+
+esp_access_state() {
+    if [[ -z "$ESP" || ! -d "$ESP" ]]; then
+        echo missing
+        return
+    fi
+
+    # Many distributions intentionally mount the ESP so only root can traverse it
+    # (for example dmask=0077). A non-root file test then looks exactly like
+    # "not found", so diagnostics must distinguish that from a real missing file.
+    if [[ $EUID -ne 0 && ! -x "$ESP" ]]; then
+        echo restricted
+        return
+    fi
+
+    echo accessible
+}
+
+secure_boot_state() {
+    if command -v mokutil >/dev/null 2>&1; then
+        local out
+        out="$(mokutil --sb-state 2>/dev/null || true)"
+        if grep -qi 'SecureBoot enabled' <<<"$out"; then echo enabled; return; fi
+        if grep -qi 'SecureBoot disabled' <<<"$out"; then echo disabled; return; fi
+    fi
+
+    local sb value
+    sb="$(find /sys/firmware/efi/efivars -maxdepth 1 -type f -name 'SecureBoot-*' -print -quit 2>/dev/null || true)"
+    if [[ -n "$sb" ]] && command -v od >/dev/null 2>&1; then
+        value="$(od -An -t u1 -j 4 -N 1 "$sb" 2>/dev/null | tr -d '[:space:]' || true)"
+        case "$value" in
+            1) echo enabled; return ;;
+            0) echo disabled; return ;;
+        esac
+    fi
+
+    if command -v bootctl >/dev/null 2>&1; then
+        local out
+        out="$(bootctl status 2>/dev/null || true)"
+        if grep -qiE 'Secure Boot:[[:space:]]*enabled' <<<"$out"; then echo enabled; return; fi
+        if grep -qiE 'Secure Boot:[[:space:]]*disabled' <<<"$out"; then echo disabled; return; fi
+    fi
+    echo unknown
+}
+
+status() {
+    local access
+    access="$(esp_access_state)"
+
+    printf 'OMEN UEFI Shutdown %s\n' "$VERSION"
+    printf '  ESP:      %s\n' "${ESP:-unknown}"
+    printf '  EFI:      %s\n' "${EFI_REL:-unknown}"
+    printf '  backend:  %s\n' "$BACKEND"
+    printf '  Boot####: %s\n' "${BOOTNUM:-not configured}"
+
+    if [[ -n "$ESP" && -f "$ESP$EFI_REL" ]]; then
+        printf '  binary:   installed\n'
+    elif [[ "$access" == restricted ]]; then
+        printf '  binary:   unknown (ESP requires root to verify)\n'
+    else
+        printf '  binary:   NOT FOUND\n'
+    fi
+
+    if [[ "$BACKEND" == bootctl ]]; then
+        if [[ -n "$ESP" && -f "$ESP/loader/entries/$ENTRY_ID" ]]; then
+            printf '  entry:    %s\n' "$ENTRY_ID"
+        elif [[ "$access" == restricted ]]; then
+            printf '  entry:    unknown (ESP requires root to verify)\n'
+        else
+            printf '  entry:    NOT FOUND (%s)\n' "$ENTRY_ID"
+        fi
+    elif [[ "$BACKEND" == efibootmgr && -n "$BOOTNUM" ]]; then
+        printf '  entry:    Boot%s\n' "$BOOTNUM"
+    fi
+
+    if [[ "$access" == restricted ]]; then
+        printf '  note:     run sudo omen-shutdown --status for complete verification\n'
+    fi
+}
+
+doctor() {
+    local problems=0 skipped=0 sb access
+    access="$(esp_access_state)"
+    printf 'OMEN UEFI Shutdown %s - diagnostics\n' "$VERSION"
+
+    if [[ "$(uname -m)" == x86_64 ]]; then
+        echo '  [OK] architecture: x86_64'
+    else
+        printf '  [FAIL] architecture: %s (x86_64 required)\n' "$(uname -m)"
+        problems=$((problems+1))
+    fi
+
+    if [[ -d /sys/firmware/efi ]]; then
+        echo '  [OK] boot mode: UEFI'
+    else
+        echo '  [FAIL] boot mode: legacy/non-UEFI'
+        problems=$((problems+1))
+    fi
+
+    if [[ -d /sys/firmware/efi/efivars ]]; then
+        echo '  [OK] efivarfs: available'
+    else
+        echo '  [FAIL] efivarfs: unavailable'
+        problems=$((problems+1))
+    fi
+
+    sb="$(secure_boot_state)"
+    case "$sb" in
+        disabled) echo '  [OK] Secure Boot: disabled' ;;
+        enabled) echo '  [FAIL] Secure Boot: enabled (binary is unsigned)'; problems=$((problems+1)) ;;
+        *) echo '  [WARN] Secure Boot: unknown' ;;
+    esac
+
+    if [[ -r "$CONFIG" ]]; then echo "  [OK] config: $CONFIG"; else echo "  [FAIL] config missing: $CONFIG"; problems=$((problems+1)); fi
+
+    if [[ -n "$ESP" && -d "$ESP" ]]; then
+        echo "  [OK] ESP path: $ESP"
+        if command -v findmnt >/dev/null 2>&1 && findmnt -rn "$ESP" >/dev/null 2>&1; then
+            printf '  [OK] ESP mounted: %s\n' "$(findmnt -no SOURCE,FSTYPE "$ESP" 2>/dev/null | head -n1)"
+        else
+            echo '  [WARN] ESP does not appear mounted'
+        fi
+    else
+        echo '  [FAIL] ESP path unavailable'
+        problems=$((problems+1))
+    fi
+
+    if [[ -n "$ESP" && -f "$ESP$EFI_REL" ]]; then
+        echo "  [OK] EFI application: $ESP$EFI_REL"
+    elif [[ "$access" == restricted ]]; then
+        echo '  [INFO] EFI application: not verified (ESP requires root)'
+        skipped=$((skipped+1))
+    else
+        echo '  [FAIL] EFI application not found'
+        problems=$((problems+1))
+    fi
+
+    case "$BACKEND" in
+        bootctl)
+            if command -v bootctl >/dev/null 2>&1; then echo '  [OK] backend command: bootctl'; else echo '  [FAIL] bootctl missing'; problems=$((problems+1)); fi
+            if [[ -n "$ESP" && -f "$ESP/loader/entries/$ENTRY_ID" ]]; then
+                echo "  [OK] systemd-boot entry: $ENTRY_ID"
+            elif [[ "$access" == restricted ]]; then
+                echo "  [INFO] systemd-boot entry: not verified (ESP requires root)"
+                skipped=$((skipped+1))
+            else
+                echo "  [FAIL] systemd-boot entry missing: $ENTRY_ID"
+                problems=$((problems+1))
+            fi
+            ;;
+        efibootmgr)
+            if command -v efibootmgr >/dev/null 2>&1; then echo '  [OK] backend command: efibootmgr'; else echo '  [FAIL] efibootmgr missing'; problems=$((problems+1)); fi
+            if [[ -n "$BOOTNUM" ]] && command -v efibootmgr >/dev/null 2>&1 && efibootmgr 2>/dev/null | grep -qi "^Boot${BOOTNUM}.*${LABEL}"; then
+                echo "  [OK] firmware entry: Boot$BOOTNUM"
+            else
+                echo '  [FAIL] firmware boot entry not found'
+                problems=$((problems+1))
+            fi
+            ;;
+        *) echo "  [WARN] backend: $BACKEND" ;;
+    esac
+
+    if command -v systemctl >/dev/null 2>&1 || command -v reboot >/dev/null 2>&1; then echo '  [OK] reboot command: available'; else echo '  [FAIL] reboot command missing'; problems=$((problems+1)); fi
+    if command -v pkexec >/dev/null 2>&1; then echo '  [OK] graphical privilege helper: pkexec'; else echo '  [WARN] pkexec missing (CLI still works)'; fi
+
+    if (( problems == 0 )); then
+        if (( skipped > 0 )); then
+            printf 'Result: PARTIAL (%d privileged check(s) skipped; run with sudo for complete verification)\n' "$skipped"
+        else
+            echo 'Result: READY'
+        fi
+        return 0
+    fi
+    printf 'Result: %d blocking problem(s) found\n' "$problems"
+    return 1
+}
+
+bootctl_cancel() {
+    command -v bootctl >/dev/null 2>&1 || return 1
+    bootctl set-oneshot "" >/dev/null
+}
+
+efibootmgr_cancel() {
+    command -v efibootmgr >/dev/null 2>&1 || return 1
+    efibootmgr -N >/dev/null 2>&1 || true
+}
+
+cancel_pending() {
+    case "$BACKEND" in
+        bootctl) bootctl_cancel ;;
+        efibootmgr) efibootmgr_cancel ;;
+        auto)
+            bootctl_cancel 2>/dev/null || true
+            efibootmgr_cancel 2>/dev/null || true
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+bootctl_backend() {
+    command -v bootctl >/dev/null 2>&1 || return 1
+    [[ -n "$ESP" && -f "$ESP/loader/entries/$ENTRY_ID" ]] || return 1
+    bootctl set-oneshot "$ENTRY_ID" >/dev/null
+}
+
+efibootmgr_backend() {
+    command -v efibootmgr >/dev/null 2>&1 || return 1
+
+    local num="$BOOTNUM"
+    if [[ -z "$num" ]] || ! efibootmgr 2>/dev/null | grep -qi "^Boot${num}.*${LABEL}"; then
+        num="$(efibootmgr 2>/dev/null | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\).*${LABEL}.*/\1/p" | head -n1)"
+    fi
+    [[ -n "$num" ]] || return 1
+    efibootmgr -n "$num" >/dev/null
+}
+
+case "$ACTION" in
+    status)
+        status
+        exit 0
+        ;;
+    doctor)
+        doctor
+        exit $?
+        ;;
+    cancel)
+        [[ $EUID -eq 0 ]] || { echo 'This action requires root. Use: sudo omen-shutdown --cancel' >&2; exit 1; }
+        cancel_pending
+        logger -t omen-uefi-shutdown 'Pending UEFI shutdown request cancelled' || true
+        echo 'Pending one-shot/BootNext request cleared.'
+        exit 0
+        ;;
+esac
+
+[[ $EUID -eq 0 ]] || {
+    printf 'This command needs root privileges. Use: sudo omen-shutdown\n' >&2
+    exit 1
+}
+
+[[ -r "$CONFIG" ]] || {
+    printf 'Configuration not found: %s. Reinstall OMEN UEFI Shutdown.\n' "$CONFIG" >&2
+    exit 1
+}
+
+[[ -n "$ESP" && -f "$ESP$EFI_REL" ]] || {
+    printf 'EFI application not found at %s%s\n' "$ESP" "$EFI_REL" >&2
+    exit 1
+}
+
+if [[ "$(secure_boot_state)" == enabled ]]; then
+    echo 'Secure Boot is enabled, but this EFI application is unsigned. Refusing to arm shutdown.' >&2
+    exit 1
+fi
+
+if (( ! YES )) && [[ -t 0 ]]; then
+    printf 'The system will reboot once into UEFI and then power off. Continue? [y/N] '
+    read -r ans
+    case "$ans" in y|Y|yes|YES|s|S|si|SI|sí|Sí) ;; *) echo 'Cancelled.'; exit 0 ;; esac
+fi
+
+logger -t omen-uefi-shutdown 'Preparing full shutdown through UEFI' || true
+sync
+
+ok=0
+case "$BACKEND" in
+    bootctl) bootctl_backend && ok=1 ;;
+    efibootmgr) efibootmgr_backend && ok=1 ;;
+    auto)
+        bootctl_backend && ok=1 || true
+        if (( ! ok )); then efibootmgr_backend && ok=1 || true; fi
+        ;;
+    *) printf 'Invalid backend in %s: %s\n' "$CONFIG" "$BACKEND" >&2; exit 1 ;;
+esac
+
+(( ok )) || {
+    echo 'Could not prepare the next boot into the UEFI application.' >&2
+    echo 'Run: sudo omen-shutdown --doctor' >&2
+    exit 1
+}
+
+logger -t omen-uefi-shutdown 'One-shot armed; reboot requested' || true
+sync
+sleep 1
+
+# If the reboot request itself fails, clear the pending one-shot so a later
+# unrelated reboot does not unexpectedly power the machine off.
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl reboot; then
+        exit 0
+    fi
+elif command -v reboot >/dev/null 2>&1; then
+    if reboot; then
+        exit 0
+    fi
+fi
+
+cancel_pending 2>/dev/null || true
+echo 'Reboot command failed; pending one-shot was cleared.' >&2
+exit 1

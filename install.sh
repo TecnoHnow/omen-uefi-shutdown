@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_EFI="$ROOT_DIR/build/omen-shutdown.efi"
+RUNTIME="$ROOT_DIR/omen-shutdown"
+DESKTOP="$ROOT_DIR/omen-uefi-shutdown.desktop"
+CONFIG=/etc/omen-uefi-shutdown.conf
+LABEL="OMEN UEFI Shutdown"
+EFI_REL="/EFI/omen-uefi-shutdown/omen-shutdown.efi"
+ENTRY_ID="omen-shutdown.conf"
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "Missing '$1'."; }
+
+[[ $EUID -eq 0 ]] || fail "Run the installer as root: sudo ./install.sh"
+[[ "$(uname -m)" == "x86_64" ]] || fail "This release supports Linux x86_64 only."
+[[ -d /sys/firmware/efi/efivars ]] || fail "System is not booted in UEFI mode or efivarfs is unavailable."
+
+secure_boot_enabled() {
+    if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; then return 0; fi
+    local sb value
+    sb="$(find /sys/firmware/efi/efivars -maxdepth 1 -type f -name 'SecureBoot-*' -print -quit 2>/dev/null || true)"
+    if [[ -n "$sb" ]] && command -v od >/dev/null 2>&1; then
+        value="$(od -An -t u1 -j 4 -N 1 "$sb" 2>/dev/null | tr -d '[:space:]' || true)"
+        [[ "$value" == 1 ]] && return 0
+    fi
+    if command -v bootctl >/dev/null 2>&1 && bootctl status 2>/dev/null | grep -qiE 'Secure Boot:[[:space:]]*enabled'; then return 0; fi
+    return 1
+}
+
+secure_boot_enabled && fail "Secure Boot is enabled. Version 0.2.1 installs an unsigned EFI application. Disable Secure Boot or sign the binary first."
+
+find_esp() {
+    local p
+    if [[ -n "${ESP:-}" ]]; then
+        [[ -d "$ESP" ]] || return 1
+        printf '%s\n' "$ESP"
+        return 0
+    fi
+    if command -v bootctl >/dev/null 2>&1; then
+        p="$(bootctl --print-esp-path 2>/dev/null || true)"
+        if [[ -n "$p" && -d "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+    fi
+    for p in /boot/efi /efi /boot; do
+        if mountpoint -q "$p" 2>/dev/null && [[ "$(findmnt -no FSTYPE "$p" 2>/dev/null || true)" == "vfat" ]]; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ESP_PATH="$(find_esp || true)"
+[[ -n "$ESP_PATH" ]] || fail "Could not detect a mounted EFI System Partition. Mount it and retry, e.g. sudo ESP=/boot/efi ./install.sh"
+ESP_PATH="${ESP_PATH%/}"
+
+if [[ ! -f "$BUILD_EFI" ]]; then
+    printf 'EFI binary not found; building it now...\n'
+    "$ROOT_DIR/build.sh" || {
+        cat >&2 <<'DEPS'
+
+Build dependencies were not found. Common package names:
+  Debian/Ubuntu/Pop!_OS: build-essential binutils gnu-efi
+  Arch/Manjaro:          base-devel binutils gnu-efi
+  Fedora/RHEL:           gcc binutils gnu-efi (or gnu-efi-devel)
+  openSUSE:              gcc binutils gnu-efi
+DEPS
+        exit 1
+    }
+fi
+
+for c in findmnt lsblk install; do need "$c"; done
+
+SOURCE="$(findmnt -no SOURCE "$ESP_PATH" | head -n1)"
+[[ -n "$SOURCE" ]] || fail "Could not determine the ESP device for $ESP_PATH"
+SOURCE="$(readlink -f "$SOURCE")"
+PKNAME="$(lsblk -no PKNAME "$SOURCE" 2>/dev/null | head -n1 | tr -d ' ')"
+PARTN="$(lsblk -no PARTN "$SOURCE" 2>/dev/null | head -n1 | tr -d ' ')"
+[[ -n "$PKNAME" && -n "$PARTN" ]] || fail "Could not determine disk/partition for $SOURCE"
+DISK="/dev/$PKNAME"
+
+printf 'Detected ESP: %s (%s, disk %s, partition %s)\n' "$ESP_PATH" "$SOURCE" "$DISK" "$PARTN"
+
+install -d -m 0755 "$ESP_PATH/EFI/omen-uefi-shutdown"
+install -m 0644 "$BUILD_EFI" "$ESP_PATH$EFI_REL"
+install -m 0755 "$RUNTIME" /usr/local/sbin/omen-shutdown
+install -m 0644 "$DESKTOP" /usr/share/applications/omen-uefi-shutdown.desktop
+
+BACKEND=""
+BOOTNUM=""
+BOOTCTL_ACTIVE=0
+
+if command -v bootctl >/dev/null 2>&1 && bootctl status 2>/dev/null | grep -qiE 'Product:[[:space:]]*systemd-boot'; then
+    BOOTCTL_ACTIVE=1
+fi
+
+if (( BOOTCTL_ACTIVE )); then
+    install -d -m 0755 "$ESP_PATH/loader/entries"
+    cat > "$ESP_PATH/loader/entries/$ENTRY_ID" <<ENTRY
+title OMEN UEFI Shutdown
+efi $EFI_REL
+ENTRY
+    BACKEND=bootctl
+else
+    need efibootmgr
+    BOOTNUM="$(efibootmgr 2>/dev/null | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\).*${LABEL}.*/\1/p" | head -n1)"
+    if [[ -z "$BOOTNUM" ]]; then
+        OLD_ORDER="$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder:[[:space:]]*//p' | head -n1)"
+        if efibootmgr --help 2>&1 | grep -q -- '--create-only'; then
+            efibootmgr --create-only --disk "$DISK" --part "$PARTN" --label "$LABEL" --loader '\EFI\omen-uefi-shutdown\omen-shutdown.efi' >/dev/null
+        else
+            efibootmgr --create --disk "$DISK" --part "$PARTN" --label "$LABEL" --loader '\EFI\omen-uefi-shutdown\omen-shutdown.efi' >/dev/null
+            if [[ -n "$OLD_ORDER" ]]; then efibootmgr -o "$OLD_ORDER" >/dev/null; fi
+        fi
+        BOOTNUM="$(efibootmgr 2>/dev/null | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\).*${LABEL}.*/\1/p" | head -n1)"
+    fi
+    [[ -n "$BOOTNUM" ]] || fail "Could not create/find the UEFI entry '$LABEL'."
+    BACKEND=efibootmgr
+fi
+
+cat > "$CONFIG" <<CFG
+# Generated by OMEN UEFI Shutdown 0.2.1
+ESP='$ESP_PATH'
+EFI_REL='$EFI_REL'
+BOOTNUM='$BOOTNUM'
+BACKEND='$BACKEND'
+CFG
+chmod 0644 "$CONFIG"
+
+printf '\nInstallation complete.\n'
+/usr/local/sbin/omen-shutdown --status
+printf '\nRecommended check:\n  sudo omen-shutdown --doctor\n'
+printf '\nTo power off:\n  sudo omen-shutdown\n'
+printf 'Desktop entry installed as: OMEN Full Shutdown / Apagado completo OMEN\n'

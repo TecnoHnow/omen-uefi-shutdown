@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=OMEN Full Shutdown
+Name[es]=Apagado completo OMEN
+Comment=Power off completely through UEFI firmware
+Comment[es]=Apaga completamente mediante el firmware UEFI
+Exec=pkexec /usr/local/sbin/omen-shutdown --yes
+TryExec=pkexec
+Icon=system-shutdown
+Terminal=false
+Categories=System;Settings;
+Keywords=shutdown;poweroff;uefi;omen;apagado;
+StartupNotify=false

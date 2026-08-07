@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gnu-efi shellcheck
+      - name: Shell syntax
+        run: bash -n build.sh install.sh uninstall.sh omen-shutdown
+      - name: ShellCheck
+        run: shellcheck build.sh install.sh uninstall.sh omen-shutdown
+      - name: Build EFI application
+        run: ./build.sh
+      - name: Verify EFI subsystem
+        run: objdump -p build/omen-shutdown.efi | grep -i 'EFI application'

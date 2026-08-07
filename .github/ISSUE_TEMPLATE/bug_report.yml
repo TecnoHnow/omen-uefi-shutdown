@@ -1,0 +1,44 @@
+name: Bug report / compatibility result
+description: Report a failure or hardware compatibility result
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. Please remove serial numbers, UUIDs and other personal identifiers from logs.
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware model
+      placeholder: HP OMEN 16 ...
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution and version
+    validations:
+      required: true
+  - type: input
+    id: bootloader
+    attributes:
+      label: Boot loader
+      placeholder: systemd-boot / GRUB / rEFInd / other
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: sudo omen-shutdown --doctor
+      description: Paste the output here after removing identifiers.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include residual heat/battery behavior and whether the UEFI application appeared.
+    validations:
+      required: true
