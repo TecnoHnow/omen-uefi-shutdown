@@ -323,8 +323,15 @@ case "$BACKEND" in
     bootctl) bootctl_backend && ok=1 ;;
     efibootmgr) efibootmgr_backend && ok=1 ;;
     auto)
-        bootctl_backend && ok=1 || true
-        if (( ! ok )); then efibootmgr_backend && ok=1 || true; fi
+        if bootctl_backend; then
+            ok=1
+        fi
+
+        if (( ! ok )); then
+            if efibootmgr_backend; then
+                ok=1
+            fi
+        fi
         ;;
     *) printf 'Invalid backend in %s: %s\n' "$CONFIG" "$BACKEND" >&2; exit 1 ;;
 esac

@@ -8,7 +8,6 @@ LABEL="OMEN UEFI Shutdown"
 
 ESP=""
 BOOTNUM=""
-BACKEND=""
 if [[ -r "$CONFIG" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG"
